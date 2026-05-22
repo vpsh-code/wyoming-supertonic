@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 server.py — Wyoming TTS server wrapping Supertonic 3.
-Exposes a TCP service that Home Assistant can discover and use.
+Uses the proper wyoming AsyncEventHandler / AsyncServer API.
 
 Usage:
     python server.py --onnx-dir /path/to/assets/onnx \
@@ -12,14 +12,14 @@ Usage:
 import argparse
 import asyncio
 import logging
-import re
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import Event
 from wyoming.info import Attribution, Info, TtsProgram, TtsVoice
-from wyoming.server import AsyncServer
+from wyoming.server import AsyncServer, AsyncEventHandler
 from wyoming.tts import Synthesize
 
 from tts_engine import AVAILABLE_LANGS, SupertonicTTS, Style, load_voice_style
@@ -34,22 +34,23 @@ VOICES = {
 
 DEFAULT_VOICE = "M1"
 DEFAULT_LANG  = "en"
-CHUNK_BYTES   = 4096   # ~93 ms at 22050 Hz 16-bit mono
+CHUNK_BYTES   = 4096
 
 
-class SupertonicHandler:
-    """Stateless per-connection handler."""
+class SupertonicHandler(AsyncEventHandler):
+    """Per-connection Wyoming event handler."""
 
-    def __init__(self, tts: SupertonicTTS, voice_dir: Path,
-                 default_voice: str, default_lang: str,
-                 total_step: int, speed: float):
+    def __init__(self, reader, writer, tts: SupertonicTTS,
+                 voice_dir: Path, default_voice: str, default_lang: str,
+                 total_step: int, speed: float, style_cache: dict):
+        super().__init__(reader, writer)
         self.tts           = tts
         self.voice_dir     = voice_dir
         self.default_voice = default_voice
         self.default_lang  = default_lang
         self.total_step    = total_step
         self.speed         = speed
-        self._style_cache: dict[str, Style] = {}
+        self._style_cache  = style_cache   # shared across connections
 
     def _get_style(self, voice_id: str) -> Style:
         if voice_id not in self._style_cache:
@@ -60,82 +61,66 @@ class SupertonicHandler:
             self._style_cache[voice_id] = load_voice_style([str(path)])
         return self._style_cache[voice_id]
 
-    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        addr = writer.get_extra_info("peername")
-        _LOGGER.debug("New connection from %s", addr)
-
-        try:
-            while True:
-                # Read Wyoming framing: <length:4LE><json_line>\n
-                header = await reader.readexactly(4)
-                length = int.from_bytes(header, "little")
-                data   = await reader.readexactly(length)
-                line   = data.decode("utf-8")
-
-                event = Event.from_json(line)
-
-                if event.type == "describe":
-                    await self._send_info(writer)
-
-                elif Synthesize.is_type(event.type):
-                    synth = Synthesize.from_event(event)
-                    await self._synthesize(synth, writer)
-
-        except asyncio.IncompleteReadError:
-            pass
-        except Exception as exc:
-            _LOGGER.exception("Handler error: %s", exc)
-        finally:
-            writer.close()
-            _LOGGER.debug("Connection closed: %s", addr)
-
-    async def _send_info(self, writer: asyncio.StreamWriter):
-        voices = [
-            TtsVoice(
-                name=vid,
-                description=desc,
-                attribution=Attribution(
-                    name="Supertone Inc.",
-                    url="https://github.com/supertone-inc/supertonic"
-                ),
-                installed=True,
-                languages=AVAILABLE_LANGS,
+    async def handle_event(self, event: Event) -> bool:
+        # ── Describe → send Info ──────────────────────────────────────────────
+        if event.type == "describe":
+            voices = [
+                TtsVoice(
+                    name=vid,
+                    description=desc,
+                    version="3.0",
+                    attribution=Attribution(
+                        name="Supertone Inc.",
+                        url="https://github.com/supertone-inc/supertonic",
+                    ),
+                    installed=True,
+                    languages=AVAILABLE_LANGS,
+                )
+                for vid, desc in VOICES.items()
+            ]
+            info = Info(
+                tts=[TtsProgram(
+                    name="supertonic",
+                    description="Supertonic 3 — On-device Neural TTS (31 languages)",
+                    version="3.0",
+                    attribution=Attribution(
+                        name="Supertone Inc.",
+                        url="https://github.com/supertone-inc/supertonic",
+                    ),
+                    installed=True,
+                    voices=voices,
+                )]
             )
-            for vid, desc in VOICES.items()
-        ]
+            await self.write_event(info.event())
+            return True
 
-        info = Info(
-            tts=[TtsProgram(
-                name="supertonic",
-                description="Supertonic 3 — On-device Neural TTS (31 languages)",
-                attribution=Attribution(
-                    name="Supertone Inc.",
-                    url="https://github.com/supertone-inc/supertonic"
-                ),
-                installed=True,
-                voices=voices,
-            )]
-        )
-        await self._write_event(writer, info.event())
+        # ── Synthesize → generate + stream audio ─────────────────────────────
+        if Synthesize.is_type(event.type):
+            synth = Synthesize.from_event(event)
+            await self._synthesize(synth)
+            return True
 
-    async def _synthesize(self, synth: Synthesize, writer: asyncio.StreamWriter):
+        return True
+
+    async def _synthesize(self, synth: Synthesize):
         text = normalize(synth.text)
-        lang = (synth.voice.language or DEFAULT_LANG) if synth.voice else DEFAULT_LANG
-        # Map BCP-47 like "en-US" → "en"
-        lang = lang.split("-")[0].lower()
+
+        # Language: BCP-47 "en-US" → "en"
+        lang = DEFAULT_LANG
+        if synth.voice and synth.voice.language:
+            lang = synth.voice.language.split("-")[0].lower()
         if lang not in AVAILABLE_LANGS:
             lang = DEFAULT_LANG
 
-        voice_name = (synth.voice.name or self.default_voice) if synth.voice else self.default_voice
-        if voice_name not in VOICES:
-            voice_name = self.default_voice
+        voice_name = self.default_voice
+        if synth.voice and synth.voice.name and synth.voice.name in VOICES:
+            voice_name = synth.voice.name
 
-        _LOGGER.info("Synthesize | voice=%s lang=%s text=%r", voice_name, lang, text[:80])
+        _LOGGER.info("Synthesize | voice=%s lang=%s | %r", voice_name, lang, text[:80])
 
         style = self._get_style(voice_name)
         sr    = self.tts.sample_rate
 
-        # Run inference (blocking — offload to thread pool)
         loop = asyncio.get_event_loop()
         wav = await loop.run_in_executor(
             None,
@@ -148,64 +133,53 @@ class SupertonicHandler:
 
         pcm = SupertonicTTS.to_int16(wav)
 
-        # Stream back
-        await self._write_event(writer, AudioStart(
-            rate=sr, width=2, channels=1
-        ).event())
-
+        await self.write_event(AudioStart(rate=sr, width=2, channels=1).event())
         for i in range(0, len(pcm), CHUNK_BYTES):
-            chunk = pcm[i:i + CHUNK_BYTES]
-            await self._write_event(writer, AudioChunk(
-                rate=sr, width=2, channels=1, audio=chunk
-            ).event())
-
-        await self._write_event(writer, AudioStop().event())
-        _LOGGER.info("Done | %.2f s audio", len(wav) / sr)
-
-    @staticmethod
-    async def _write_event(writer: asyncio.StreamWriter, event: Event):
-        line = event.to_json() + "\n"
-        data = line.encode("utf-8")
-        writer.write(len(data).to_bytes(4, "little") + data)
-        await writer.drain()
+            await self.write_event(
+                AudioChunk(rate=sr, width=2, channels=1, audio=pcm[i:i+CHUNK_BYTES]).event()
+            )
+        await self.write_event(AudioStop().event())
+        _LOGGER.info("Done | %.2fs audio", len(wav) / sr)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 async def main():
     parser = argparse.ArgumentParser(description="Wyoming Supertonic TTS server")
-    parser.add_argument("--onnx-dir",     required=True, help="Path to ONNX model directory")
-    parser.add_argument("--voice-dir",    required=True, help="Path to voice_styles directory")
-    parser.add_argument("--host",         default="0.0.0.0")
-    parser.add_argument("--port",         type=int, default=10200)
-    parser.add_argument("--voice",        default=DEFAULT_VOICE, choices=list(VOICES))
-    parser.add_argument("--lang",         default=DEFAULT_LANG)
-    parser.add_argument("--steps",        type=int, default=8, help="Denoising steps (quality)")
-    parser.add_argument("--speed",        type=float, default=1.05)
-    parser.add_argument("--log-level",    default="INFO")
+    parser.add_argument("--onnx-dir",  required=True)
+    parser.add_argument("--voice-dir", required=True)
+    parser.add_argument("--host",      default="0.0.0.0")
+    parser.add_argument("--port",      type=int, default=10200)
+    parser.add_argument("--voice",     default=DEFAULT_VOICE, choices=list(VOICES))
+    parser.add_argument("--lang",      default=DEFAULT_LANG)
+    parser.add_argument("--steps",     type=int, default=8)
+    parser.add_argument("--speed",     type=float, default=1.05)
+    parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
     logging.basicConfig(level=args.log_level.upper(),
                         format="%(asctime)s %(levelname)s %(message)s")
 
-    _LOGGER.info("Loading Supertonic 3 models from %s …", args.onnx_dir)
+    _LOGGER.info("Loading Supertonic 3 from %s …", args.onnx_dir)
     tts = SupertonicTTS(args.onnx_dir)
-    _LOGGER.info("Models loaded. Sample rate: %d Hz", tts.sample_rate)
+    _LOGGER.info("Ready | sample_rate=%d Hz", tts.sample_rate)
 
-    handler = SupertonicHandler(
+    style_cache: dict = {}
+
+    server = AsyncServer.from_uri(f"tcp://{args.host}:{args.port}")
+    _LOGGER.info("Wyoming Supertonic listening on %s:%d", args.host, args.port)
+
+    handler_factory = partial(
+        SupertonicHandler,
         tts=tts,
         voice_dir=Path(args.voice_dir),
         default_voice=args.voice,
         default_lang=args.lang,
         total_step=args.steps,
         speed=args.speed,
+        style_cache=style_cache,
     )
 
-    server = await asyncio.start_server(handler.handle, args.host, args.port)
-    _LOGGER.info("Wyoming Supertonic ready on %s:%d", args.host, args.port)
-    _LOGGER.info("Voices: %s", ", ".join(VOICES))
-
-    async with server:
-        await server.serve_forever()
+    await server.run(handler_factory)
 
 
 if __name__ == "__main__":
