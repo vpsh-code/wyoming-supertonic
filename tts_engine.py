@@ -201,7 +201,7 @@ class SupertonicTTS:
         # Box-Muller
         u1 = np.clip(np.random.random((1, latent_dim_v, latent_len)), 1e-4, 1.0)
         u2 = np.random.random((1, latent_dim_v, latent_len))
-        xt = np.sqrt(-2.0 * np.log(u1)) * np.cos(2 * np.pi * u2).astype(np.float32)
+        xt = (np.sqrt(-2.0 * np.log(u1)) * np.cos(2 * np.pi * u2)).astype(np.float32)
 
         wav_len = int(duration[0] * sr)
         lat_len_actual = math.ceil(wav_len / chunk_size)
