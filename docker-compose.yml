@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  wyoming-supertonic:
+    build: .
+    # Or use pre-built: image: ghcr.io/vpsh-code/wyoming-supertonic:latest
+    container_name: wyoming-supertonic
+    restart: unless-stopped
+    ports:
+      - "10200:10200"
+    volumes:
+      # Point these at your downloaded ONNX assets
+      - /path/to/supertonic-demo/public/assets/onnx:/models/onnx:ro
+      - /path/to/supertonic-demo/public/assets/voice_styles:/models/voice_styles:ro
+    command: >
+      python server.py
+      --onnx-dir  /models/onnx
+      --voice-dir /models/voice_styles
+      --host      0.0.0.0
+      --port      10200
+      --voice     M1
+      --lang      en
+      --steps     8
+      --speed     1.05
