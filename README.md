@@ -1,6 +1,13 @@
 # Wyoming Supertonic
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Wyoming Streaming](https://img.shields.io/badge/Wyoming-Streaming%20TTS-brightgreen)](https://www.home-assistant.io/integrations/wyoming/)
+
 Home Assistant Wyoming TTS server powered by **[Supertonic 3](https://github.com/supertone-inc/supertonic)** — on-device, no cloud, 31 languages.
+
+- **🔴 Streaming TTS** — `stream_response: true` — audio plays sentence-by-sentence, no waiting for the full response
+- **Wyoming protocol** — native HA Assist pipeline integration  
+- **10 voices** (M1–M5, F1–F5), **31 languages**, fully on-device
 
 > **Using Home Assistant OS?** The easiest path is the [HAOS add-on](https://github.com/vpsh-code/ha-addons-supertonic) — it handles everything automatically.  
 > This repo is for **HA Container / Core / Supervised** users running the Wyoming server directly on their host machine.
