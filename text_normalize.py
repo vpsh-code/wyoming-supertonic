@@ -46,6 +46,9 @@ def normalize(text: str) -> str:
                        ('SW','southwest'),('SE','southeast')]:
         t = re.sub(rf'\b{abbr}\b', full, t)
 
+    # Decimal numbers → spoken form  (23.1 → 23 point 1)
+    t = re.sub(r'(\d+)\.(\d+)', r'\1 point \2', t)
+
     # Collapse extra spaces
     t = re.sub(r'  +', ' ', t)
     return t.strip()
