@@ -7,7 +7,7 @@ import math
 import random
 import struct
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Generator, Optional
 
 import numpy as np
 import onnxruntime as ort
@@ -228,6 +228,24 @@ class SupertonicTTS:
             audio_parts.append(wav)
 
         return np.concatenate(audio_parts) if audio_parts else np.array([], dtype=np.float32)
+
+    def synthesize_streaming(self, text: str, lang: str, style: Style,
+                             total_step: int = 8, speed: float = 1.05,
+                             silence_sec: float = 0.3,
+                             progress_cb: Optional[Callable] = None
+                             ) -> Generator[np.ndarray, None, None]:
+        """Yield one float32 PCM array per sentence chunk as it is synthesised."""
+        max_len = 120 if lang in ("ko", "ja") else 300
+        chunks  = self._chunk(text, max_len)
+        silence = np.zeros(int(silence_sec * self.sample_rate), dtype=np.float32)
+        first   = True
+
+        for chunk in chunks:
+            wav, _ = self._infer(chunk, lang, style, total_step, speed, progress_cb)
+            if not first:
+                yield silence.copy()
+            first = False
+            yield wav
 
     @staticmethod
     def to_int16(wav: np.ndarray) -> bytes:

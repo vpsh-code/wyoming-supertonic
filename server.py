@@ -16,6 +16,7 @@ from functools import partial
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import Event
 from wyoming.info import Attribution, Info, TtsProgram, TtsVoice
@@ -120,26 +121,39 @@ class SupertonicHandler(AsyncEventHandler):
 
         style = self._get_style(voice_name)
         sr    = self.tts.sample_rate
+        loop  = asyncio.get_event_loop()
 
-        loop = asyncio.get_event_loop()
-        wav = await loop.run_in_executor(
-            None,
-            lambda: self.tts.synthesize(
-                text, lang, style,
-                total_step=self.total_step,
-                speed=self.speed,
-            )
+        # Split text into sentence chunks up front (fast, no ONNX)
+        max_len = 120 if lang in ("ko", "ja") else 300
+        chunks  = self.tts._chunk(text, max_len)
+        silence = SupertonicTTS.to_int16(
+            np.zeros(int(0.3 * sr), dtype=np.float32)
         )
 
-        pcm = SupertonicTTS.to_int16(wav)
-
         await self.write_event(AudioStart(rate=sr, width=2, channels=1).event())
-        for i in range(0, len(pcm), CHUNK_BYTES):
-            await self.write_event(
-                AudioChunk(rate=sr, width=2, channels=1, audio=pcm[i:i+CHUNK_BYTES]).event()
+
+        total_samples = 0
+        for idx, chunk in enumerate(chunks):
+            # Each sentence synthesised in thread pool → streams as it finishes
+            wav = await loop.run_in_executor(
+                None,
+                lambda c=chunk: self.tts._infer(c, lang, style, self.total_step, self.speed)[0]
             )
+            if idx > 0:
+                # inter-sentence silence
+                for i in range(0, len(silence), CHUNK_BYTES):
+                    await self.write_event(
+                        AudioChunk(rate=sr, width=2, channels=1, audio=silence[i:i+CHUNK_BYTES]).event()
+                    )
+            pcm = SupertonicTTS.to_int16(wav)
+            for i in range(0, len(pcm), CHUNK_BYTES):
+                await self.write_event(
+                    AudioChunk(rate=sr, width=2, channels=1, audio=pcm[i:i+CHUNK_BYTES]).event()
+                )
+            total_samples += len(wav)
+
         await self.write_event(AudioStop().event())
-        _LOGGER.info("Done | %.2fs audio", len(wav) / sr)
+        _LOGGER.info("Done | %.2fs audio in %d chunk(s)", total_samples / sr, len(chunks))
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
